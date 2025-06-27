@@ -1,10 +1,13 @@
 import streamlit as st
-import sqlite3
 import hashlib
 from datetime import datetime, timedelta
 import pandas as pd
 import plotly.express as px
 import json
+
+# NOVO: Importações para Google Sheets
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # --- Configurações da Página Streamlit (DEVE SER O PRIMEIRO COMANDO STREAMLIT) ---
 st.set_page_config(
@@ -13,8 +16,37 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- Configurações Iniciais ---
-DB_NAME = 'financas_familia.db' # Nome do arquivo do banco de dados
+# --- Configurações do Google Sheets ---
+# ALERTA: Substitua estes nomes pelos nomes EXATOS da sua planilha e abas no Google Sheets.
+# EX: Se sua planilha se chama "Meu Controle Financeiro", use GOOGLE_SHEET_NAME = "Meu Controle Financeiro"
+GOOGLE_SHEET_NAME = "app_financas" # <<< VERIFIQUE E AJUSTE ESTE NOME PARA O DA SUA PLANILHA NO DRIVE
+USERS_WORKSHEET_NAME = "users"
+TRANSACTIONS_WORKSHEET_NAME = "transacoes"
+GOALS_WORKSHEET_NAME = "goals" # Se você criou a aba de metas, caso contrário, comente esta linha e suas referências
+
+# --- Conexão e Autenticação com Google Sheets (Usando st.secrets) ---
+@st.cache_resource # Use st.cache_resource para evitar reconexões a cada rerun
+def get_sheets_client():
+    try:
+        # st.secrets["gcp_service_account"] é a forma segura de acessar suas credenciais
+        # que você configurará no painel do Streamlit Cloud (NÃO no GitHub!)
+        creds_info = st.secrets["gcp_service_account"]
+        
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_info, scope)
+        client = gspread.authorize(creds)
+        
+        spreadsheet = client.open(GOOGLE_SHEET_NAME)
+        return spreadsheet
+    except Exception as e:
+        st.error(f"Erro ao conectar ao Google Sheets. Verifique suas credenciais e compartilhamento da planilha. Erro: {e}")
+        st.stop() # Interrompe a execução se não conseguir conectar
+        
+spreadsheet = get_sheets_client()
+users_sheet = spreadsheet.worksheet(USERS_WORKSHEET_NAME)
+transactions_sheet = spreadsheet.worksheet(TRANSACTIONS_WORKSHEET_NAME)
+goals_sheet = spreadsheet.worksheet(GOALS_WORKSHEET_NAME) # Certifique-se que esta aba existe na sua planilha!
+
 
 # --- Funções de Ajuda para Segurança (Hashing) ---
 def make_hashes(password):
@@ -25,227 +57,408 @@ def check_hashes(password, hashed_text):
     """Verifica se a senha fornecida corresponde ao hash armazenado."""
     return make_hashes(password) == hashed_text
 
-# --- Funções do Banco de Dados para Usuários ---
-def init_user_db():
-    """Inicializa o banco de dados de usuários e cria a tabela 'users'."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                username TEXT PRIMARY KEY,
-                password TEXT NOT NULL
-            )
-        ''')
-        conn.commit()
+# --- Funções do Banco de Dados para Usuários (AGORA PARA GOOGLE SHEETS) ---
+# init_user_db não é mais necessário da mesma forma, pois as abas são criadas manualmente.
+# No entanto, vamos garantir que as planilhas existam ao tentar acessá-las no get_sheets_client.
 
 def add_user(username, password):
-    """Adiciona um novo usuário ao banco de dados."""
+    """Adiciona um novo usuário ao Google Sheet 'users'."""
     hashed_password = make_hashes(password)
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        try:
-            cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, hashed_password))
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError: # Usuário já existe
-            return False
+    try:
+        # Verifica se o usuário já existe antes de adicionar
+        all_users = users_sheet.get_all_records()
+        df_users = pd.DataFrame(all_users)
+        if not df_users.empty and username in df_users['username'].values:
+            return False # Usuário já existe
+        
+        users_sheet.append_row([username, hashed_password])
+        return True
+    except Exception as e:
+        st.error(f"Erro ao adicionar usuário ao Google Sheet: {e}")
+        return False
 
 def verify_user(username, password):
-    """Verifica as credenciais do usuário."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT password FROM users WHERE username = ?", (username,))
-        result = cursor.fetchone()
-        if result:
-            hashed_password_db = result[0]
+    """Verifica as credenciais do usuário no Google Sheet 'users'."""
+    try:
+        all_users = users_sheet.get_all_records()
+        df_users = pd.DataFrame(all_users)
+        
+        if df_users.empty:
+            return False # Ninguém cadastrado
+        
+        user_row = df_users[df_users['username'] == username]
+        if not user_row.empty:
+            hashed_password_db = user_row['password'].iloc[0]
             return check_hashes(password, hashed_password_db)
         return False
-
-# --- Funções do Banco de Dados para Transações Financeiras ---
-def init_transactions_db():
-    """Inicializa o banco de dados de transações e cria a tabela 'transacoes'."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS transacoes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                data TEXT NOT NULL,
-                descricao TEXT NOT NULL,
-                valor REAL NOT NULL,
-                tipo TEXT NOT NULL, -- 'receita' ou 'despesa'
-                categoria TEXT,    -- para despesa ou tipo de receita
-                username TEXT NOT NULL, -- Para vincular a transação ao usuário logado
-                
-                -- Campos específicos para Receita
-                responsavel TEXT, 
-                banco TEXT,       
-                forma_recebimento TEXT, 
-                datas_parcelas_receita TEXT,    -- JSON string de datas
-                
-                -- Novos campos específicos para Despesa
-                recorrente TEXT,    -- 'Sim' ou 'Não'
-                vezes_recorrencia INTEGER, -- Quantas vezes a despesa se repete
-                status TEXT,        -- 'A Pagar' ou 'Pago'
-                
-                FOREIGN KEY (username) REFERENCES users(username)
-            )
-        ''')
-        conn.commit()
-
-# --- Funções do Banco de Dados para Metas ---
-def init_goals_db():
-    """Inicializa o banco de dados de metas e cria a tabela 'goals'."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS goals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL,
-                descricao TEXT NOT NULL,
-                valor_meta REAL NOT NULL,
-                categoria TEXT NOT NULL,
-                data_limite TEXT NOT NULL,
-                valor_atual REAL DEFAULT 0.0, -- Quanto já foi contribuído para a meta
-                status TEXT DEFAULT 'Em Progresso', -- 'Em Progresso', 'Concluída', 'Cancelada'
-                FOREIGN KEY (username) REFERENCES users(username)
-            )
-        ''')
-        conn.commit()
-
-def add_goal(username, descricao, valor_meta, categoria, data_limite):
-    """Adiciona uma nova meta ao banco de dados."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO goals (username, descricao, valor_meta, categoria, data_limite, status)
-            VALUES (?, ?, ?, ?, ?, 'Em Progresso')
-        ''', (username, descricao, valor_meta, categoria, data_limite))
-        conn.commit()
-
-def get_goals(username):
-    """Recupera todas as metas de um usuário específico."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, descricao, valor_meta, categoria, data_limite, valor_atual, status FROM goals WHERE username = ?", (username,))
-        return cursor.fetchall()
-
-def update_goal_progress(goal_id, username, amount):
-    """Atualiza o progresso (valor_atual) de uma meta."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE goals SET valor_atual = valor_atual + ? WHERE id = ? AND username = ?", (amount, goal_id, username))
-        conn.commit()
-
-def mark_goal_as_completed(goal_id, username):
-    """Marca uma meta como concluída e define valor_atual como valor_meta."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        # Primeiro, obtenha o valor_meta da meta
-        cursor.execute("SELECT valor_meta FROM goals WHERE id = ? AND username = ?", (goal_id, username))
-        result = cursor.fetchone()
-        if result:
-            valor_meta = result[0]
-            cursor.execute("UPDATE goals SET status = 'Concluída', valor_atual = ? WHERE id = ? AND username = ?", (valor_meta, goal_id, username))
-            conn.commit()
-            return True
+    except Exception as e:
+        st.error(f"Erro ao verificar usuário no Google Sheet: {e}")
         return False
 
-def delete_goal(goal_id, username):
-    """Exclui uma meta específica de um usuário."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM goals WHERE id = ? AND username = ?", (goal_id, username))
-        conn.commit()
-        return cursor.rowcount > 0
-
-
-# Funções para gerenciar Nomes e Bancos
-def get_unique_responsibles(username):
-    """Obtém todos os responsáveis únicos para um usuário."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT responsavel FROM transacoes WHERE username = ? AND responsavel IS NOT NULL", (username,))
-        return [row[0] for row in cursor.fetchall()]
-
-def get_unique_banks(username):
-    """Obtém todos os bancos únicos para um usuário."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT banco FROM transacoes WHERE username = ? AND banco IS NOT NULL", (username,))
-        return [row[0] for row in cursor.fetchall()]
-
+# --- Funções do Banco de Dados para Transações Financeiras (AGORA PARA GOOGLE SHEETS) ---
+# init_transactions_db não é mais necessário.
 
 def add_transaction(username, data, descricao, valor, tipo, categoria=None,
                     responsavel=None, banco=None, forma_recebimento=None, datas_parcelas_receita=None,
                     recorrente=None, vezes_recorrencia=None, status=None):
-    """Adiciona uma nova transação ao banco de dados, vinculada ao usuário."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO transacoes (username, data, descricao, valor, tipo, categoria,
-                                    responsavel, banco, forma_recebimento, datas_parcelas_receita,
-                                    recorrente, vezes_recorrencia, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (username, data, descricao, valor, tipo, categoria,
-              responsavel, banco, forma_recebimento, datas_parcelas_receita,
-              recorrente, vezes_recorrencia, status))
-        conn.commit()
+    """Adiciona uma nova transação ao Google Sheet 'transacoes'."""
+    try:
+        # Geração de ID simples: pega o último ID e incrementa
+        # Isso pode não ser robusto para múltiplos usuários simultâneos em alta escala,
+        # mas funciona para um app familiar.
+        all_transactions = transactions_sheet.get_all_records()
+        df_temp = pd.DataFrame(all_transactions)
+        next_id = 1
+        if not df_temp.empty and 'id' in df_temp.columns and pd.api.types.is_numeric_dtype(df_temp['id']):
+            next_id = df_temp['id'].max() + 1
+        
+        row = [
+            next_id,
+            data,
+            descricao,
+            valor,
+            tipo,
+            categoria,
+            username, # Salva o username para vincular a transação
+            responsavel,
+            banco,
+            datas_parcelas_receita, # Já deve ser uma string JSON ou None
+            recorrente,
+            vezes_recorrencia,
+            status
+        ]
+        transactions_sheet.append_row(row)
+        return True
+    except Exception as e:
+        st.error(f"Erro ao adicionar transação ao Google Sheet: {e}")
+        st.exception(e) # Para debug
+        return False
 
 def get_transactions(username):
-    """Recupera todas as transações de um usuário específico."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT id, data, descricao, valor, tipo, categoria, responsavel, banco,
-                   forma_recebimento, datas_parcelas_receita, recorrente,
-                   vezes_recorrencia, status
-            FROM transacoes WHERE username = ? ORDER BY data DESC
-        ''', (username,))
-        return cursor.fetchall()
+    """Recupera todas as transações de um usuário específico do Google Sheet 'transacoes'."""
+    try:
+        # Pega todos os registros e converte para DataFrame
+        all_records = transactions_sheet.get_all_records()
+        df = pd.DataFrame(all_records)
+        
+        if df.empty:
+            return pd.DataFrame(columns=[
+                'ID', 'Data', 'Descrição', 'Valor', 'Tipo', 'Categoria', 'Username', 'Responsavel', 'Banco',
+                'Forma Recebimento', 'Datas Parcelas Receita', 'Recorrente', 'Vezes Recorrencia', 'Status'
+            ]) # Retorna DataFrame vazio com as colunas esperadas
+        
+        # Garante que as colunas tenham nomes amigáveis (ajustando de volta ao padrão do código)
+        # É importante que os cabeçalhos na planilha sejam EXATOS aos nomes minúsculos aqui
+        df.columns = [col.lower().replace(' ', '_') for col in df.columns]
+
+        # Filtrar pelo username (coluna 'username' deve existir e ser preenchida na planilha)
+        if 'username' in df.columns:
+            df = df[df['username'] == username]
+        else:
+            st.warning("Coluna 'username' não encontrada na planilha 'transacoes'. A filtragem por usuário pode não funcionar corretamente.")
+        
+        # Converter tipos de dados, pois gspread lê tudo como string
+        df['data'] = pd.to_datetime(df['data'], errors='coerce') # 'coerce' transforma em NaT se o formato for inválido
+        df['valor'] = pd.to_numeric(df['valor'], errors='coerce')
+        df['vezes_recorrencia'] = pd.to_numeric(df['vezes_recorrencia'], errors='coerce').fillna(0).astype(int) # Preenche NaN com 0 para int
+
+        # Renomear colunas para o formato que o resto do código espera (Capitalizado, com espaços)
+        df.columns = [col.replace('_', ' ').title() for col in df.columns]
+
+        return df
+    except Exception as e:
+        st.error(f"Erro ao obter transações do Google Sheet: {e}")
+        st.exception(e) # Para debug
+        return pd.DataFrame() # Retorna DataFrame vazio em caso de erro
 
 def delete_transaction(transaction_id, username):
-    """Exclui uma transação específica de um usuário."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM transacoes WHERE id = ? AND username = ?", (transaction_id, username))
-        conn.commit()
-        return cursor.rowcount > 0 # Retorna True se alguma linha foi deletada
-
-def update_transaction(transaction_id, username, **kwargs):
-    """Atualiza uma transação específica de um usuário."""
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
-        set_clause = ", ".join([f"{k} = ?" for k in kwargs.keys()])
-        values = list(kwargs.values())
-        values.extend([transaction_id, username]) # Adiciona ID e username no final para a cláusula WHERE
-
+    """Exclui uma transação específica do Google Sheet 'transacoes'."""
+    try:
+        # gspread não tem delete por valor. Precisa encontrar o número da linha.
+        # Ler todas as transações, encontrar o ID e deletar a linha.
+        all_records = transactions_sheet.get_all_values() # Pega todos os valores como lista de listas
+        
+        # Encontra o índice da linha de cabeçalho
+        header = all_records[0]
         try:
-            cursor.execute(f"UPDATE transacoes SET {set_clause} WHERE id = ? AND username = ?", tuple(values))
-            conn.commit()
-            return cursor.rowcount > 0
-        except Exception as e:
-            print(f"Erro ao atualizar transação: {e}")
+            id_col_idx = header.index('id') # Encontra o índice da coluna 'id' (minúsculo)
+            user_col_idx = header.index('username') # Encontra o índice da coluna 'username'
+        except ValueError:
+            st.error("Colunas 'id' ou 'username' não encontradas na planilha 'transacoes'.")
             return False
 
-def get_summary_current_month(username):
-    """Calcula o resumo de receitas e despesas para o mês atual para um usuário específico."""
-    current_year_month = datetime.now().strftime("%Y-%m")
-    with sqlite3.connect(DB_NAME) as conn:
-        cursor = conn.cursor()
+        # Itera pelas linhas (começando da 1, pois 0 é o cabeçalho)
+        # O número da linha na planilha é o índice na lista + 1
+        row_to_delete_idx = -1
+        for i, row in enumerate(all_records[1:]): 
+            if i < len(all_records) - 1: # Garante que não está fora do limite
+                current_id = None
+                current_username_row = None
+                try:
+                    current_id = int(row[id_col_idx])
+                    current_username_row = row[user_col_idx]
+                except (ValueError, IndexError):
+                    continue # Pula linhas com ID inválido ou fora do range
+
+                if current_id == transaction_id and current_username_row == username:
+                    row_to_delete_idx = i + 2 # +1 para pular cabeçalho, +1 para converter para índice baseado em 1 da planilha
+                    break
         
-        # Receitas do mês atual
-        cursor.execute("SELECT SUM(valor) FROM transacoes WHERE username = ? AND tipo = 'receita' AND strftime('%Y-%m', data) = ?", (username, current_year_month))
-        total_receitas = cursor.fetchone()[0] or 0.0
+        if row_to_delete_idx != -1:
+            transactions_sheet.delete_rows(row_to_delete_idx)
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Erro ao excluir transação do Google Sheet: {e}")
+        st.exception(e)
+        return False
 
-        # Despesas pagas do mês atual
-        cursor.execute("SELECT SUM(valor) FROM transacoes WHERE username = ? AND tipo = 'despesa' AND status = 'Pago' AND strftime('%Y-%m', data) = ?", (username, current_year_month))
-        total_despesas_pagas = cursor.fetchone()[0] or 0.0
+def update_transaction(transaction_id, username, **kwargs):
+    """Atualiza uma transação específica no Google Sheet 'transacoes'."""
+    try:
+        all_records = transactions_sheet.get_all_values() # Pega todos os valores como lista de listas
+        header = all_records[0] # Cabeçalhos
+        
+        # Mapeia nomes de colunas do Python para os nomes da planilha (minúsculas)
+        col_map = {k.lower(): k for k in header} 
 
-        # Despesas a pagar do mês atual
-        cursor.execute("SELECT SUM(valor) FROM transacoes WHERE username = ? AND tipo = 'despesa' AND status = 'A Pagar' AND strftime('%Y-%m', data) = ?", (username, current_year_month))
-        total_despesas_apagar = cursor.fetchone()[0] or 0.0
+        row_index_in_sheet = -1 # Índice da linha na planilha (baseado em 1)
+        update_cells = [] # Lista de (linha, coluna, novo_valor)
 
-        return total_receitas, total_despesas_pagas, total_despesas_apagar
+        # Encontra a linha da transação e prepara as atualizações
+        for i, row_data in enumerate(all_records[1:]): # Começa do índice 1 para pular cabeçalho
+            try:
+                # Obtenha o ID e username da linha atual, usando o índice da coluna
+                current_id_idx = header.index('id')
+                current_username_idx = header.index('username')
+                
+                current_id = int(row_data[current_id_idx])
+                current_username_row = row_data[current_username_idx]
+
+                if current_id == transaction_id and current_username_row == username:
+                    row_index_in_sheet = i + 2 # +1 para pular cabeçalho, +1 para converter para índice baseado em 1 da planilha
+                    
+                    # Para cada alteração solicitada, encontre a coluna e prepare a atualização
+                    for key, value in kwargs.items():
+                        col_name_in_sheet = key.lower() # Converte para minúscula para comparar com cabeçalho
+                        if col_name_in_sheet in col_map: # Verifica se a coluna existe na planilha
+                            col_index_in_sheet = header.index(col_name_in_sheet) + 1 # Coluna baseada em 1
+                            update_cells.append({
+                                'range': gspread.utils.rowcol_to_a1(row_index_in_sheet, col_index_in_sheet),
+                                'values': [[value]]
+                            })
+                    break
+            except (ValueError, IndexError) as e:
+                # Isso pode acontecer se houver linhas mal formatadas ou vazias
+                print(f"Skipping malformed row: {row_data}. Error: {e}")
+                continue
+
+
+        if row_index_in_sheet != -1 and update_cells:
+            # st.error(f"Atualizando: {update_cells}") # Para debug
+            transactions_sheet.batch_update(update_cells)
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Erro ao atualizar transação no Google Sheet: {e}")
+        st.exception(e)
+        return False
+
+
+def get_summary_current_month(username):
+    """Calcula o resumo de receitas e despesas para o mês atual para um usuário específico (Google Sheet)."""
+    df = get_transactions(username) # Já retorna DataFrame filtrado e formatado
+    if df.empty:
+        return 0.0, 0.0, 0.0
+
+    current_year_month = datetime.now().strftime("%Y-%m")
+    
+    # Certifica-se de que a coluna 'Data' é datetime e 'Tipo' e 'Status' são strings
+    df['Data'] = pd.to_datetime(df['Data'], errors='coerce')
+    df['Tipo'] = df['Tipo'].astype(str)
+    df['Status'] = df['Status'].astype(str)
+
+    # Filtrar pelo mês atual
+    df_current_month = df[df['Data'].dt.strftime("%Y-%m") == current_year_month].copy()
+
+    total_receitas = df_current_month[df_current_month['Tipo'].str.lower() == 'receita']['Valor'].sum()
+    total_despesas_pagas = df_current_month[(df_current_month['Tipo'].str.lower() == 'despesa') & (df_current_month['Status'].str.lower() == 'pago')]['Valor'].sum()
+    total_despesas_apagar = df_current_month[(df_current_month['Tipo'].str.lower() == 'despesa') & (df_current_month['Status'].str.lower() == 'a pagar')]['Valor'].sum()
+
+    return float(total_receitas), float(total_despesas_pagas), float(total_despesas_apagar)
+
+# --- Funções do Banco de Dados para Metas (AGORA PARA GOOGLE SHEETS) ---
+# init_goals_db não é mais necessário.
+
+def add_goal(username, descricao, valor_meta, categoria, data_limite):
+    """Adiciona uma nova meta ao Google Sheet 'goals'."""
+    try:
+        all_goals = goals_sheet.get_all_records()
+        df_temp = pd.DataFrame(all_goals)
+        next_id = 1
+        if not df_temp.empty and 'id' in df_temp.columns and pd.api.types.is_numeric_dtype(df_temp['id']):
+            next_id = df_temp['id'].max() + 1
+            
+        row = [next_id, username, descricao, valor_meta, categoria, data_limite, 0.0, 'Em Progresso']
+        goals_sheet.append_row(row)
+        return True
+    except Exception as e:
+        st.error(f"Erro ao adicionar meta ao Google Sheet: {e}")
+        st.exception(e)
+        return False
+
+def get_goals(username):
+    """Recupera todas as metas de um usuário específico do Google Sheet 'goals'."""
+    try:
+        all_records = goals_sheet.get_all_records()
+        df = pd.DataFrame(all_records)
+
+        if df.empty:
+             return pd.DataFrame(columns=[
+                'ID', 'Username', 'Descricao', 'Valor Meta', 'Categoria', 'Data Limite', 'Valor Atual', 'Status'
+            ]) # Retorna DataFrame vazio com as colunas esperadas
+        
+        # Garante que as colunas tenham nomes amigáveis
+        df.columns = [col.lower().replace(' ', '_') for col in df.columns]
+
+        if 'username' in df.columns:
+            df = df[df['username'] == username]
+        else:
+            st.warning("Coluna 'username' não encontrada na planilha 'goals'. Filtragem por usuário pode não funcionar.")
+
+        # Converte tipos
+        df['valor_meta'] = pd.to_numeric(df['valor_meta'], errors='coerce')
+        df['valor_atual'] = pd.to_numeric(df['valor_atual'], errors='coerce')
+        df['data_limite'] = pd.to_datetime(df['data_limite'], errors='coerce')
+
+        # Renomear colunas para o formato que o resto do código espera (Capitalizado, com espaços)
+        df.columns = [col.replace('_', ' ').title() for col in df.columns]
+
+        return df
+    except Exception as e:
+        st.error(f"Erro ao obter metas do Google Sheet: {e}")
+        st.exception(e)
+        return pd.DataFrame()
+
+def update_goal_progress(goal_id, username, amount):
+    """Atualiza o progresso (valor_atual) de uma meta no Google Sheet 'goals'."""
+    try:
+        all_records = goals_sheet.get_all_values()
+        header = all_records[0]
+        
+        id_col_idx = header.index('id')
+        user_col_idx = header.index('username')
+        valor_atual_col_idx = header.index('valor_atual')
+        
+        row_index_in_sheet = -1
+        current_valor_atual = 0.0
+
+        for i, row_data in enumerate(all_records[1:]):
+            try:
+                current_id = int(row_data[id_col_idx])
+                current_username_row = row_data[user_col_idx]
+                if current_id == goal_id and current_username_row == username:
+                    row_index_in_sheet = i + 2 # Linha na planilha (baseado em 1)
+                    current_valor_atual = float(row_data[valor_atual_col_idx])
+                    break
+            except (ValueError, IndexError):
+                continue
+        
+        if row_index_in_sheet != -1:
+            new_valor_atual = current_valor_atual + amount
+            goals_sheet.update_cell(row_index_in_sheet, valor_atual_col_idx + 1, new_valor_atual) # Coluna baseada em 1
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Erro ao atualizar progresso da meta no Google Sheet: {e}")
+        st.exception(e)
+        return False
+
+def mark_goal_as_completed(goal_id, username):
+    """Marca uma meta como concluída e define valor_atual como valor_meta no Google Sheet 'goals'."""
+    try:
+        all_records = goals_sheet.get_all_values()
+        header = all_records[0]
+        
+        id_col_idx = header.index('id')
+        user_col_idx = header.index('username')
+        valor_meta_col_idx = header.index('valor_meta')
+        status_col_idx = header.index('status')
+        valor_atual_col_idx = header.index('valor_atual') # Também precisa atualizar
+        
+        row_index_in_sheet = -1
+        valor_meta_for_goal = 0.0
+
+        for i, row_data in enumerate(all_records[1:]):
+            try:
+                current_id = int(row_data[id_col_idx])
+                current_username_row = row_data[user_col_idx]
+                if current_id == goal_id and current_username_row == username:
+                    row_index_in_sheet = i + 2 # Linha na planilha (baseado em 1)
+                    valor_meta_for_goal = float(row_data[valor_meta_col_idx])
+                    break
+            except (ValueError, IndexError):
+                continue
+        
+        if row_index_in_sheet != -1:
+            # Prepara as atualizações
+            updates = [
+                {'range': gspread.utils.rowcol_to_a1(row_index_in_sheet, status_col_idx + 1), 'values': [["Concluída"]]},
+                {'range': gspread.utils.rowcol_to_a1(row_index_in_sheet, valor_atual_col_idx + 1), 'values': [[valor_meta_for_goal]]}
+            ]
+            goals_sheet.batch_update(updates)
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Erro ao marcar meta como concluída no Google Sheet: {e}")
+        st.exception(e)
+        return False
+
+def delete_goal(goal_id, username):
+    """Exclui uma meta específica do Google Sheet 'goals'."""
+    try:
+        all_records = goals_sheet.get_all_values()
+        header = all_records[0]
+        
+        id_col_idx = header.index('id')
+        user_col_idx = header.index('username')
+        
+        row_to_delete_idx = -1
+        for i, row in enumerate(all_records[1:]):
+            try:
+                current_id = int(row[id_col_idx])
+                current_username_row = row[user_col_idx]
+                if current_id == goal_id and current_username_row == username:
+                    row_to_delete_idx = i + 2
+                    break
+            except (ValueError, IndexError):
+                continue
+
+        if row_to_delete_idx != -1:
+            goals_sheet.delete_rows(row_to_delete_idx)
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Erro ao excluir meta do Google Sheet: {e}")
+        st.exception(e)
+        return False
+
+# Funções para gerenciar Nomes e Bancos (AGORA PARA GOOGLE SHEETS)
+def get_unique_responsibles(username):
+    """Obtém todos os responsáveis únicos para um usuário do Google Sheet 'transacoes'."""
+    df = get_transactions(username)
+    if df.empty or 'Responsavel' not in df.columns:
+        return []
+    # Usar .dropna().unique().tolist() para evitar valores nulos e obter uma lista
+    return df['Responsavel'].dropna().unique().tolist()
+
+def get_unique_banks(username):
+    """Obtém todos os bancos únicos para um usuário do Google Sheet 'transacoes'."""
+    df = get_transactions(username)
+    if df.empty or 'Banco' not in df.columns:
+        return []
+    return df['Banco'].dropna().unique().tolist()
+
 
 # --- Funções de Renderização de Formulários ---
 def render_unified_transaction_form(current_username):
@@ -463,9 +676,8 @@ def render_overview_dashboard(current_username, df_all_transactions):
 
     st.markdown("---")
     st.subheader("Progresso das Metas")
-    goals = get_goals(current_username)
-    if goals:
-        goals_df = pd.DataFrame(goals, columns=['ID', 'Descrição', 'Valor Meta', 'Categoria', 'Data Limite', 'Valor Atual', 'Status'])
+    goals_df = get_goals(current_username) # Get goals returns a DataFrame now
+    if not goals_df.empty: # Check if DataFrame is not empty
         goals_df['Progresso (%)'] = (goals_df['Valor Atual'] / goals_df['Valor Meta'] * 100).round(2)
         goals_df['Progresso (%)'] = goals_df['Progresso (%)'].clip(upper=100) # Limita a 100%
 
@@ -805,7 +1017,7 @@ def render_detailed_analysis_section(df_all_transactions):
     fig_proj = px.bar(proj_df.reset_index(), x='Mês', y=['Receitas', 'Despesas', 'Saldo'],
                       title='Projeção Mensal de Fluxo de Caixa',
                       barmode='group',
-                      color_discrete_map={'Receitas': 'green', 'Despesas': 'red', 'Saldo': 'blue'})
+                      color_discrete_map={'Receitas': 'green', 'Despesa': 'red', 'Saldo': 'blue'})
     st.plotly_chart(fig_proj, use_container_width=True)
 
 def render_planning_section(current_username):
@@ -838,9 +1050,8 @@ def render_planning_section(current_username):
 
     st.markdown("---")
     st.subheader("Suas Metas Atuais")
-    goals = get_goals(current_username)
-    if goals:
-        goals_df = pd.DataFrame(goals, columns=['ID', 'Descrição', 'Valor Meta', 'Categoria', 'Data Limite', 'Valor Atual', 'Status'])
+    goals_df = get_goals(current_username) # Get goals returns a DataFrame now
+    if not goals_df.empty: # Check if DataFrame is not empty
         goals_df['Progresso (%)'] = (goals_df['Valor Atual'] / goals_df['Valor Meta'] * 100).round(2)
         goals_df['Progresso (%)'] = goals_df['Progresso (%)'].clip(upper=100) # Limita a 100%
         
@@ -879,10 +1090,10 @@ def render_planning_section(current_username):
         st.info("Nenhuma meta definida ainda.")
 
 
-# --- Inicialização dos Bancos de Dados ---
-init_user_db()
-init_transactions_db()
-init_goals_db() # Inicializa o banco de dados de metas
+# --- Inicialização dos Bancos de Dados (REMOVIDAS POIS AGORA USA GOOGLE SHEETS) ---
+# init_user_db()
+# init_transactions_db()
+# init_goals_db()
 
 # --- Gerenciamento de Sessão (Login) ---
 if 'logged_in' not in st.session_state:
@@ -941,21 +1152,9 @@ if st.session_state['logged_in']:
     selected_option = st.sidebar.radio("Navegação", app_menu)
 
     current_username = st.session_state['username']
-    all_transactions_data = get_transactions(current_username) # Carrega todas as transações uma vez
+    # A função get_transactions já foi adaptada para o Google Sheets
+    df_all_transactions = get_transactions(current_username) 
     
-    # Converte para DataFrame aqui para ser usado por todas as seções
-    if all_transactions_data:
-        df_all_transactions = pd.DataFrame(all_transactions_data, columns=[
-            'ID', 'Data', 'Descrição', 'Valor', 'Tipo', 'Categoria', 'Responsavel', 'Banco',
-            'Forma Recebimento', 'Datas Parcelas Receita', 'Recorrente', 'Vezes Recorrencia', 'Status'
-        ])
-        df_all_transactions['Data'] = pd.to_datetime(df_all_transactions['Data'])
-    else:
-        df_all_transactions = pd.DataFrame(columns=[
-            'ID', 'Data', 'Descrição', 'Valor', 'Tipo', 'Categoria', 'Responsavel', 'Banco',
-            'Forma Recebimento', 'Datas Parcelas Receita', 'Recorrente', 'Vezes Recorrencia', 'Status'
-        ])
-
     # Renderiza a seção selecionada
     if selected_option == "📊 Visão Geral":
         render_overview_dashboard(current_username, df_all_transactions)
